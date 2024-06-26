@@ -420,16 +420,14 @@ var syncPunch = pipeline($ => $
 
       var msgToSrc = req
       msgToSrc.body = {
-        role: 'server',
-        dstIP: destEp.ip,
+        destIP: destEp.ip,
         destPort: destEp.port,
       }
 
       var msgToDst = req
       msgToDst.body = {
-        role: 'client',
-        dstIP: srcEp.ip,
-        dstPort: destEp.port,
+        destIP: srcEp.ip,
+        destPort: srcEp.port,
       }
 
       return pipeline($ => $
