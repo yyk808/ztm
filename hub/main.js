@@ -63,6 +63,11 @@ var routes = Object.entries({
     'DELETE': () => forwardRequest,
   },
 
+  '/api/punch/{ep}/{proto}/{svc}/request': {
+    'GET': () => forwardRequest,
+    'POST': () => syncPunch,
+  }
+
 }).map(
   function ([path, methods]) {
     var match = new http.Match(path)
@@ -126,12 +131,12 @@ function endpointName(id) {
 
 function isEndpointOnline(ep) {
   if (!sessions[ep.id]?.size) return false
-  if (ep.heartbeat + 30*1000 < Date.now()) return false
+  if (ep.heartbeat + 30 * 1000 < Date.now()) return false
   return true
 }
 
 function isEndpointOutdated(ep) {
-  return (ep.heartbeat + 60*1000 < Date.now())
+  return (ep.heartbeat + 60 * 1000 < Date.now())
 }
 
 var $ctx = null
@@ -142,7 +147,7 @@ var $hubSelected = null
 var $pingID
 
 function start() {
-  pipy.listen(opt['--listen'], $=>$
+  pipy.listen(opt['--listen'], $ => $
     .onStart(
       function (conn) {
         $ctx = {
@@ -163,8 +168,8 @@ function start() {
           $ctx.username = tls.peer?.subject?.commonName
         }
       }
-    }).to($=>$
-      .demuxHTTP().to($=>$
+    }).to($ => $
+      .demuxHTTP().to($ => $
         .pipe(
           function (evt) {
             if (evt instanceof MessageStart) {
@@ -191,22 +196,22 @@ function start() {
   clearOutdatedEndpoints()
 }
 
-var postStatus = pipeline($=>$
+var postStatus = pipeline($ => $
   .replaceMessage(
     function (req) {
       var info = JSON.decode(req.body)
       Object.assign(
         $endpoint, {
-          name: info.name,
-          heartbeat: Date.now(),
-        }
+        name: info.name,
+        heartbeat: Date.now(),
+      }
       )
       return new Message({ status: 201 })
     }
   )
 )
 
-var getEndpoints = pipeline($=>$
+var getEndpoints = pipeline($ => $
   .replaceData()
   .replaceMessage(
     () => response(200, Object.values(endpoints).map(
@@ -223,7 +228,7 @@ var getEndpoints = pipeline($=>$
   )
 )
 
-var getEndpoint = pipeline($=>$
+var getEndpoint = pipeline($ => $
   .replaceData()
   .replaceMessage(
     function () {
@@ -244,7 +249,7 @@ var getEndpoint = pipeline($=>$
   )
 )
 
-var getServices = pipeline($=>$
+var getServices = pipeline($ => $
   .replaceData()
   .replaceMessage(
     function () {
@@ -271,7 +276,7 @@ var getServices = pipeline($=>$
   )
 )
 
-var postServices = pipeline($=>$
+var postServices = pipeline($ => $
   .replaceMessage(
     function (req) {
       var body = JSON.decode(req.body)
@@ -301,7 +306,7 @@ var postServices = pipeline($=>$
   )
 )
 
-var getService = pipeline($=>$
+var getService = pipeline($ => $
   .replaceData()
   .replaceMessage(
     function () {
@@ -320,13 +325,18 @@ var getService = pipeline($=>$
   )
 )
 
-var muxToAgent = pipeline($=>$
-  .muxHTTP(() => $hubSelected, { version: 2 }).to($=>$
-    .swap(() => $hubSelected)
-  )
-)
 
-var connectEndpoint = pipeline($=>$
+var muxToTarget = (hub) => {
+  return pipeline($ => $
+    .muxHTTP(() => hub, { version: 2 }).to($ => $
+      .swap(() => hub)
+    )
+  )
+}
+
+var muxToAgent = muxToTarget($hubSelected)
+
+var connectEndpoint = pipeline($ => $
   .acceptHTTPTunnel(
     function () {
       var id = $params.ep
@@ -338,7 +348,7 @@ var connectEndpoint = pipeline($=>$
       console.info(`Endpoint ${endpointName(id)} joined, connections = ${sessions[id].size}`)
       return response(200)
     }
-  ).to($=>$
+  ).to($ => $
     .onStart(new Data)
     .swap(() => $hub)
     .onEnd(() => {
@@ -349,7 +359,7 @@ var connectEndpoint = pipeline($=>$
   )
 )
 
-var connectService = pipeline($=>$
+var connectService = pipeline($ => $
   .acceptHTTPTunnel(
     function () {
       var svc = $params.svc
@@ -364,7 +374,7 @@ var connectService = pipeline($=>$
       console.info(`Forward to ${svc} at ${endpointName(id)}`)
       return response(200)
     }
-  ).to($=>$
+  ).to($ => $
     .connectHTTPTunnel(
       () => new Message({
         method: 'CONNECT',
@@ -374,7 +384,7 @@ var connectService = pipeline($=>$
   )
 )
 
-var forwardRequest = pipeline($=>$
+var forwardRequest = pipeline($ => $
   .pipe(
     function (req) {
       if (req instanceof MessageStart) {
@@ -392,21 +402,63 @@ var forwardRequest = pipeline($=>$
   )
 )
 
+var syncPunch = pipeline($ => $
+  .pipe(function (req) {
+    if (req instanceof MessageStart) {
+      var srcEp = endpoints[$ctx.id]
+      var destEp = endpoints[$params.ep]
+      if (!srcEp || !destEp) return notFound
+      if (!canOperate($ctx.username, ep)) return notAllowed
+
+      var targetHub
+      sessions[$ctx.id]?.forEach?.(h => $hubSelected = h)
+      sessions[$params.ep]?.forEach?.(h => targetHub = h)
+      if (!$hubSelected) return notFound
+
+      req.head.path = `/api/punch/${$params.ep}/${$params.proto}/${$params.svc}/sync`
+      req.head.method = 'POST'
+
+      var msgToSrc = req
+      msgToSrc.body = {
+        role: 'server',
+        dstIP: destEp.ip,
+        destPort: destEp.port,
+      }
+
+      var msgToDst = req
+      msgToDst.body = {
+        role: 'client',
+        dstIP: srcEp.ip,
+        dstPort: destEp.port,
+      }
+
+      return pipeline($ => $
+        .onStart(msgToDst)
+        .fork().to($ => $
+          .replaceMessage(msg => msgToSrc)
+          .pipe(muxToAgent) // service publisher
+        )
+        .pipe(muxToTarget(targetHub)) // service subscriber
+      )
+    }
+  })
+)
+
 //
 // Ping agents regularly
 //
 
-pipeline($=>$
+pipeline($ => $
   .onStart(new Message({ path: '/api/ping' }))
-  .repeat(() => new Timeout(15).wait().then(true)).to($=>$
-    .forkJoin(() => Object.keys(sessions)).to($=>$
+  .repeat(() => new Timeout(15).wait().then(true)).to($ => $
+    .forkJoin(() => Object.keys(sessions)).to($ => $
       .onStart(id => { $pingID = id })
       .forkJoin(() => {
         var hubs = []
         sessions[$pingID].forEach(h => hubs.push(h))
         return hubs
-      }).to($=>$
-        .onStart(hub => { $hubSelected = hub})
+      }).to($ => $
+        .onStart(hub => { $hubSelected = hub })
         .pipe(muxToAgent)
         .replaceData()
         .replaceMessage(
@@ -426,22 +478,22 @@ pipeline($=>$
   )
 ).spawn()
 
-var notFound = pipeline($=>$
+var notFound = pipeline($ => $
   .replaceData()
   .replaceMessage(response(404))
 )
 
-var notSupported = pipeline($=>$
+var notSupported = pipeline($ => $
   .replaceData()
   .replaceMessage(response(405))
 )
 
-var notAllowed = pipeline($=>$
+var notAllowed = pipeline($ => $
   .replaceData()
   .replaceMessage(response(403))
 )
 
-var noSession = pipeline($=>$
+var noSession = pipeline($ => $
   .replaceData()
   .replaceMessage(response(404, 'No agent session established yet'))
 )

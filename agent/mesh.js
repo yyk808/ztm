@@ -62,14 +62,14 @@ export default function (config) {
   // Utility pipelies
   //
 
-  var bypass = pipeline($=>$)
+  var bypass = pipeline($ => $)
 
-  var wrapUDP = pipeline($=>$
+  var wrapUDP = pipeline($ => $
     .replaceData(data => data.size > 0 ? new Message(data) : undefined)
     .encodeWebSocket()
   )
 
-  var unwrapUDP = pipeline($=>$
+  var unwrapUDP = pipeline($ => $
     .decodeWebSocket()
     .replaceMessage(msg => msg.body)
   )
@@ -81,6 +81,7 @@ export default function (config) {
 
   function Hub(address) {
     var connections = new Set
+    var holes = {}
     var closed = false
     var serviceList = null
     var serviceListUpdateTime = 0
@@ -98,15 +99,15 @@ export default function (config) {
     var $serviceListTime
 
     // Long-lived agent-to-hub connection, multiplexed with HTTP/2
-    var hubSession = pipeline($=>$
-      .muxHTTP(() => '', { version: 2 }).to($=>$
+    var hubSession = pipeline($ => $
+      .muxHTTP(() => '', { version: 2 }).to($ => $
         .connectTLS({
           ...tlsOptions,
           onState: (session) => {
             var err = session.error
             if (err) meshError(err)
           }
-        }).to($=>$
+        }).to($ => $
           .onStart(() => { meshErrors.length = 0 })
           .connect(address, {
             onState: function (conn) {
@@ -128,7 +129,7 @@ export default function (config) {
     )
 
     // Send a request to the hub
-    var requestHub = pipeline($=>$
+    var requestHub = pipeline($ => $
       .onStart(msg => msg)
       .pipe(hubSession)
       .handleMessage(msg => $response = msg)
@@ -137,10 +138,10 @@ export default function (config) {
     )
 
     // Hook up to the hub and receive orders
-    var reverseServer = pipeline($=>$
+    var reverseServer = pipeline($ => $
       .onStart(new Data)
-      .repeat(() => new Timeout(5).wait().then(() => !closed)).to($=>$
-        .loop($=>$
+      .repeat(() => new Timeout(5).wait().then(() => !closed)).to($ => $
+        .loop($ => $
           .connectHTTPTunnel(
             new Message({
               method: 'CONNECT',
@@ -157,10 +158,10 @@ export default function (config) {
     reverseServer.spawn()
 
     // Start sending service list updates
-    pipeline($=>$
+    pipeline($ => $
       .onStart(new Data)
-      .repeat(() => new Timeout(1).wait().then(() => !closed)).to($=>$
-        .forkJoin().to($=>$
+      .repeat(() => new Timeout(1).wait().then(() => !closed)).to($ => $
+        .forkJoin().to($ => $
           .pipe(
             () => {
               if (serviceListUpdateTime > serviceListSendTime) {
@@ -169,31 +170,31 @@ export default function (config) {
               }
               return 'wait'
             }, {
-              'wait': ($=>$.replaceStreamStart(new StreamEnd)),
-              'send': ($=>$.replaceStreamStart(
-                () => requestHub.spawn(
-                  new Message(
-                    {
-                      method: 'POST',
-                      path: `/api/services`,
-                    },
-                    JSON.encode({
-                      time: $serviceListTime,
-                      services: serviceList || [],
-                    })
-                  )
-                ).then(
-                  function (res) {
-                    if (res && res.head.status === 201) {
-                      if (serviceListSendTime < $serviceListTime) {
-                        serviceListSendTime = $serviceListTime
-                      }
-                    }
-                    return new StreamEnd
-                  }
+            'wait': ($ => $.replaceStreamStart(new StreamEnd)),
+            'send': ($ => $.replaceStreamStart(
+              () => requestHub.spawn(
+                new Message(
+                  {
+                    method: 'POST',
+                    path: `/api/services`,
+                  },
+                  JSON.encode({
+                    time: $serviceListTime,
+                    services: serviceList || [],
+                  })
                 )
-              )),
-            }
+              ).then(
+                function (res) {
+                  if (res && res.head.status === 201) {
+                    if (serviceListSendTime < $serviceListTime) {
+                      serviceListSendTime = $serviceListTime
+                    }
+                  }
+                  return new StreamEnd
+                }
+              )
+            )),
+          }
           )
         )
         .replaceStreamStart(new StreamEnd)
@@ -213,6 +214,24 @@ export default function (config) {
           JSON.encode({ name: config.agent.name })
         )
       )
+    }
+
+    function createHole(epName, proto, svcName) {
+      var key = holeName(epName, proto, svcName)
+      var svc = findService(proto, svcName)
+      var hole = Hole(epName, svc, key)
+
+      if (hole.state != 'fail') {
+        holes[key] = hole
+        return hole
+      }
+
+      return null
+    }
+
+    function advertiseFilesystem(files) {
+      filesystemLatest = files
+      filesystemUpdate = files
     }
 
     function discoverEndpoints() {
@@ -245,7 +264,7 @@ export default function (config) {
 
     function findEndpoint(ep) {
       return requestHub.spawn(
-        new Message({ method: 'GET', path: `/api/endpoints/${ep}`})
+        new Message({ method: 'GET', path: `/api/endpoints/${ep}` })
       ).then(
         function (res) {
           if (res && res.head.status === 200) {
@@ -259,7 +278,7 @@ export default function (config) {
 
     function findService(proto, svc) {
       return requestHub.spawn(
-        new Message({ method: 'GET', path: `/api/services/${proto}/${svc}`})
+        new Message({ method: 'GET', path: `/api/services/${proto}/${svc}` })
       ).then(
         function (res) {
           if (res && res.head.status === 200) {
@@ -271,28 +290,341 @@ export default function (config) {
       )
     }
 
+    function findHole(ep, proto, svcName) {
+      var key = holeName(ep, proto, svcName)
+      return holes[key]
+    }
+
     function leave() {
       closed = true
       connections.forEach(
         conn => conn.close()
+      )
+      holes.forEach(
+        (_, hole) => hole.leave()
       )
     }
 
     return {
       isConnected: () => connections.size > 0,
       address,
+      holes,
+      createHole,
       heartbeat,
       updateServiceList,
       discoverEndpoints,
       discoverServices,
       findEndpoint,
       findService,
+      findHole,
       leave,
     }
 
   } // End of class Hub
 
+  // Only available for symmetric NAT
+  function Hole(ep, svc, holeName) {
+    // TODO: Hole should be bound to ep not svc
+    var bound = '0.0.0.0:' + randomPort()   // local port that the hole using
+    var destIP                              // dest ip out of NAT
+    var destPort                            // dest port out of NAT
+    var role = null                         // server or client
+    var proto = svc.protocol
+
+    var state = 'closed' // closed forwarding connecting connected fail
+    var $hubConnection = null
+    var $connection = null
+    var $hub = hubs[0]
+    var $pHub = new pipeline.Hub
+    var $session
+    var $hubResponse
+
+    // A temp tunnel to help hub gather NAT info.
+    var hubSession = pipeline($ => $
+      .muxHTTP(() => holeName + "hub", { version: 2 }).to($ => $
+        .connectTLS({
+          ...tlsOptions,
+          onState: (session) => {
+            var err = session.error
+            if (err) state = 'fail'
+          }
+        }).to($ => $
+          .connect($hub.address, {
+            onState: function (conn) {
+              $hubConnection = conn
+              if (conn.state === 'open') {
+                // SOL_SOCKET & SO_REUSEPORT
+                conn.socket.setRawOption(1, 15, new Data([1]))
+              }
+
+              if (conn.state === 'connected' && state === 'closed') {
+                state = 'hub-forward'
+              }
+            },
+            bind: bound,
+          })
+        )
+      )
+    )
+
+    // FIXME: we should only receive /punch/xxx/sync here
+    // FIXME: close after direct session created
+    pipeline($ => $
+      .onStart(new Data)
+      .repeat(() => new Timeout(5).wait().then(() => {
+        return state != 'failed' || state != 'closed'
+      })).to($ => $
+        .loop($ => $
+          .connectHTTPTunnel(
+            new Message({
+              method: 'CONNECT',
+              path: `/api/endpoints/${config.agent.id}`,
+            })
+          )
+          .to(() => {
+            switch (state) {
+              case 'closed':
+              case 'forwarding':
+              case 'connecting':
+                return hubSession
+              case 'connected':
+                return $session
+              default:
+                state = 'failed'
+                return pipeline($ => $.dummy())
+            }
+          })
+          .pipe(serveHub)
+        )
+      )
+    ).spawn()
+
+    function directSession() {
+      // TODO !!! state error would happen when network is slow
+      // must handle this
+
+      if (!role) meshError('Hole not init correctly')
+      if ($session) return $session
+
+      // TODO: support TLS connection
+      if (role === 'client') {
+        // make session to server side directly
+        $session = pipeline($ => $
+          .muxHTTP(() => holeName + "direct", {version: 2}).to($ => $
+            .connect(`${destIP}:${destPort}`, {
+              onState: function (conn) {
+                if (conn.state === 'open') {
+                  conn.socket.setRawOption(1, 15, new Data([1]))
+                } else if (conn.state === 'connected') {
+                  logInfo(`Connected to remote ${destIP}:${destPort}`)
+                  $connection = conn
+                  state = 'connected'
+                } else if (conn.state === 'closed') {
+                  logInfo(`Disconnected from remote ${destIP}:${destPort}`)
+                  $connection = null
+                  state = 'closed'
+                }
+              },
+              bind: bound
+            })
+          )
+        )
+
+        // reverse server for receiving requests
+        pipeline($ => $
+          .onStart(new Data)
+          .repeat(() => new Timeout(5).wait().then(() => {
+            return state != 'fail' || state != 'closed'
+          })).to($ => $
+            .loop($ => $
+              .connectHTTPTunnel(
+                new Message({
+                  method: 'CONNECT',
+                  path: `/api/punch/${ep}/${proto}/${svc.name}`,
+                })
+              )
+              .to($session)
+              .pipe(serveHub)
+            )
+          )
+        ).spawn()
+
+      } else if (role === 'server') {
+        pipy.listen(bound, 'tcp', serveHub)
+
+        $session = pipeline($ => $
+          .muxHTTP(() => holeName + "direct", { version: 2 }).to($ => $
+            .swap(() => $pHub)
+          )
+        )
+      }
+
+      return $session
+    }
+
+    // use THE port sending request to hub.
+    function requestPunch() {
+      // FIXME: add state check
+      state = 'connecting'
+      role = 'client'
+
+      pipeline($ => $
+        .onStart(new Message({
+          method: 'GET',
+          path: `/api/punch/${ep}/${proto}/${svc}/request`,
+        }))
+        .pipe(hubSession)
+        .handleMessage(msg => $hubResponse = msg)
+        .replaceMessage(new StreamEnd)
+        .onEnd(() => $hubResponse)
+      ).spawn()
+    }
+
+    // TODO add cert info into response
+    function acceptPunch() {
+      state = 'connecting'
+      role = 'server'
+
+      pipeline($ => $
+        .onStart(new Message({
+          method: 'POST',
+          path: `/api/punch/${ep}/${proto}/${svc}/reqeust`,
+        }))
+        .pipe(hubSession)
+        .handleMessage(msg => $hubResponse = msg)
+        .replaceMessage(new StreamEnd)
+        .onEnd(() => $hubResponse)
+      ).spawn()
+    }
+
+    function punch(destIP, destPort) {
+      // receive TLS options
+      // connectTLS
+      // connectLocal or connectRemote
+
+      // TODO add retry logic here
+      state = 'connecting'
+      makeFakeCall(destIP, destPort)
+      $session = directSession()
+      heartbeat() // activate the session pipeline
+    }
+
+    function makeRespTunnel() {
+      // TODO add state check
+      state = 'connected'
+
+      return pipeline($ => $
+        .acceptHTTPTunnel(() => response200()).to($ => $
+          .onStart(new Data)
+          .swap(() => $pHub)
+          .onEnd(() => console.info(`Direct Connection from ${ep} lost`))
+        )
+      )
+    }
+
+    function makeServiceTunnel() {
+      return pipeline()
+    }
+
+    var directToMesh = pipeline($ => $
+      .pipe($ => $
+        .onStart(() => logInfo(`Direct to ${svc.name} at endpoint ${ep}`))
+        .pipe(proto === 'udp' ? wrapUDP : bypass)
+        .connectHTTPTunnel(() => (
+          // Looks just like this is sent from hub
+          new Message({
+            method: 'CONNECT',
+            path: `/api/services/${proto}/${svc.name}`,
+          })
+        )).to($ => $
+          .muxHTTP(() => hole, { version: 2 }).to($ => $
+            .connectTLS(/* tlsOptions */).to($ => $
+              .connect(() => `${destIP}:${destPort}`, {
+                onState: function (conn) {
+                  if (conn.state === 'open') {
+                    // SOL_SOCKET & SO_REUSEPORT
+                  conn.socket.setRawOption(1, 15, new Data([1]))
+                  conn.socket.setRawOption(1, 15, new Data([1]))
+                } else if (conn.state === 'connected') {
+                  logInfo(`Connected to remote ${destIP}:${destPort}`)
+                  $connection = conn
+                  state = 'connected'
+                } else if (conn.state === 'closed') {
+                  logInfo(`Disconnected from remote ${destIP}:${destPort}`)
+                  $connection = null
+                  state = 'closed'
+                    conn.socket.setRawOption(1, 15, new Data([1]))
+                } else if (conn.state === 'connected') {
+                  logInfo(`Connected to remote ${destIP}:${destPort}`)
+                  $connection = conn
+                  state = 'connected'
+                } else if (conn.state === 'closed') {
+                  logInfo(`Disconnected from remote ${destIP}:${destPort}`)
+                  $connection = null
+                  state = 'closed'
+                  }
+                },
+                bind: bound
+              })
+            )
+          )
+        )
+        .pipe(proto === 'udp' ? unwrapUDP : bypass)
+        .onEnd(() => logInfo(`Direct to ${svc} at endpoint ${ep} ended`))
+      )
+    )
+
+    // send a SYN to dest, expect no return.
+    // this will cheat the firewall to allow inbound connection from dest.
+    function makeFakeCall(destIP, destPort) {
+      pipy().task().onStart(new Data).connect(`${destIP}:${destPort}`, {
+        bind: bound,
+        onState: function (conn) {
+          // REUSEPORT
+          if (conn.state === 'open') conn.socket.setRawOption(1, 15, new Data([1]))
+
+            // abort this connection.
+          if (conn.state === 'connecting')conn.close()
+        }
+      })
+    }
+
+
+    function heartbeat() {
+      // no need to do so
+      if (role === 'server' || connectHub || state === 'failed') {
+        return
+      }
+
+      // requestHub.spawn(
+      //   new Message(
+      //     { method: 'POST', path: '/api/status' },
+      //     JSON.encode({ name: config.agent.name })
+      //   )
+      // )
+
+    }
+
+    function leave() {
+
+    }
+
+    return {
+      state,
+      isConnected,
+      requestPunch,
+      acceptPunch,
+      punch,
+      makeRespTunnel,
+      directSession,
+      directToMesh,
+      heartbeat,
+      leave,
+    }
+  } // End of Hole
+
   var matchServices = new http.Match('/api/services/{proto}/{svc}')
+  var matchPunch = new http.Match('/api/punch/{ep}/{proto}/{svc}')
   var response200 = new Message({ status: 200 })
   var response404 = new Message({ status: 404 })
 
@@ -308,14 +640,20 @@ export default function (config) {
   //   Hub ----/
   //
 
-  var serveHub = pipeline($=>$
-    .demuxHTTP().to($=>$
+  var serveHub = pipeline($ => $
+    .demuxHTTP().to($ => $
       .pipe(
         function (evt) {
           if (evt instanceof MessageStart) {
             if (evt.head.method === 'CONNECT') {
-              var params = matchServices(evt.head.path)
-              if (params) return proxyToLocal
+              var svcParams = matchServices(evt.head.path)
+              if (svcParams) return proxyToLocal
+
+              var punchParams = matchPunch(evt.head.path)
+              if (punchParams) {
+                var hole = findHole(punchParams.ep, punchParams.proto, punchParams.svc)
+                return hole.makeRespTunnel()
+              }
             }
             return serveOtherAgents
           }
@@ -325,14 +663,14 @@ export default function (config) {
   )
 
   //
-  // Agent handling hub-forwarded requests from other agents
+  // Agent handling requests from other agents
   //
   //   Remote Agent ----> Hub ----\
-  //   Remote Agent ----> Hub -----)----> Agent
+  //   Remote Agent ---(directly)--)----> Agent
   //   Remote Agent ----> Hub ----/
   //
 
-  var serveOtherAgents = (function() {
+  var serveOtherAgents = (function () {
     var routes = Object.entries({
 
       '/api/ping': {
@@ -389,6 +727,11 @@ export default function (config) {
           var target = body.target
           openPort(params.ip, params.proto, port, target.service, target.endpoint)
           db.setPort(meshName, params.ip, params.proto, port, body)
+
+          // request to punch a hole.
+          var hole = hubs[0].createHole(target.endpoint, params.proto, target.svc)
+          hole.requestPunch()
+
           return response(201, db.getPort(meshName, params.ip, params.proto, port))
         },
 
@@ -406,6 +749,87 @@ export default function (config) {
         }
       },
 
+      '/api/punch/{ep}/{proto}/{svc}/request': {
+        // handle punch hole request from peer or hub.
+        // Agent ---> Hub ---> Service Publisher(Remote Agent)
+        'GET': function (params) {
+          var hole = hubs[0].createHole(params.ep, params.proto, params.svc)
+          hole.acceptPunch()
+
+          return response(200)
+        },
+
+        // 'POST': only implement on hub side.
+        // Service Publisher -> Hub
+      },
+
+      '/api/punch/{ep}/{proto}/{svc}/sync': {
+        // Hub sent synchronize message. Once receive, start punch.
+        // Agent <- Hub -> Remote Agent.
+        'POST': function (params, req) {
+          var body = JSON.decode(req.body)
+          // FIXME not done yet
+          var hole = findHole(params.ep, params.proto, params.svc)
+          if (!hole) {
+            response(400)
+          }
+
+          hole.punch()
+        }
+      },
+
+      '/api/file-data/{hash}': {
+        'GET': function ({ hash }) {
+          var data = fs.raw(hash)
+          return data ? response(200, data) : response(404)
+        },
+      },
+
+      '/api/apps': {
+        'GET': function () {
+          return discoverApps(config.agent.id).then(
+            ret => response(200, ret)
+          )
+        }
+      },
+
+      '/api/apps/{provider}/{app}': {
+        'GET': function ({ provider, app }) {
+          return findApp(config.agent.id, provider, app).then(
+            ret => ret ? response(200, ret) : response(404)
+          )
+        },
+
+        'POST': function ({ provider, app }, req) {
+          var ep = config.agent.id
+          var state = JSON.decode(req.body)
+          return findApp(ep, provider, app).then(ret => {
+            if (!ret) return installApp(ep, provider, app)
+          }).then(() => {
+            if ('isRunning' in state) {
+              if (state.isRunning) {
+                apps.start(provider, app)
+              } else {
+                apps.stop(provider, app)
+              }
+            }
+            return response(201)
+          }).then(() => {
+            if ('isPublished' in state) {
+              if (state.isPublished) {
+                return publishApp(ep, provider, app)
+              } else {
+                return unpublishApp(ep, provider, app)
+              }
+            }
+          }).then(response(201))
+        },
+
+        'DELETE': function ({ provider, app }) {
+          return uninstallApp(config.agent.id, provider, app).then(response(204))
+        },
+      },
+
     }).map(
       function ([path, methods]) {
         var match = new http.Match(path)
@@ -418,7 +842,7 @@ export default function (config) {
       }
     )
 
-    return pipeline($=>$
+    return pipeline($ => $
       .replaceMessage(
         function (req) {
           var params
@@ -432,14 +856,14 @@ export default function (config) {
   })()
 
   //
-  // Agent proxying to local services: mesh -> local
+  // Agent proxying to local services: mesh -> local OR agent -> local(with hole punched)
   //
   //   Remote Client ----> Remote Agent ----> Hub ----\                  /----> Local Service
-  //   Remote Client ----> Remote Agent ----> Hub -----)----> Agent ----(-----> Local Service
+  //   Remote Client ----> Remote Agent ---------------)----> Agent ----(-----> Local Service
   //   Remote Client ----> Remote Agent ----> Hub ----/                  \----> Local Service
   //
 
-  var proxyToLocal = pipeline($=>$
+  var proxyToLocal = pipeline($ => $
     .acceptHTTPTunnel(
       function (req) {
         var params = matchServices(req.head.path)
@@ -455,10 +879,10 @@ export default function (config) {
         }
         return response404
       }
-    ).to($=>$
+    ).to($ => $
       .pipe(() => $requestedService.protocol, {
-        'tcp': ($=>$.connect(() => `${$requestedService.host}:${$requestedService.port}`)),
-        'udp': ($=>$
+        'tcp': ($ => $.connect(() => `${$requestedService.host}:${$requestedService.port}`)),
+        'udp': ($ => $
           .pipe(unwrapUDP)
           .connect(() => `${$requestedService.host}:${$requestedService.port}`, { protocol: 'udp' })
           .pipe(wrapUDP)
@@ -476,7 +900,7 @@ export default function (config) {
   //   Local Client ----/                  \----> Hub ----> Remote Agent ----> Remote Service
   //
 
-  var proxyToMesh = (proto, svc, ep) => pipeline($=>$
+  var proxyToMesh = (proto, svc, ep) => pipeline($ => $
     .onStart(() => {
       if (ep) {
         $selectedEp = ep
@@ -496,25 +920,36 @@ export default function (config) {
       }
     })
     .pipe(() => $selectedHub ? 'proxy' : 'deny', {
-      'proxy': ($=>$
+      'proxy': ($ => $
         .onStart(() => logInfo(`Proxy to ${svc} at endpoint ${$selectedEp} via ${$selectedHub}`))
         .pipe(proto === 'udp' ? wrapUDP : bypass)
-        .connectHTTPTunnel(() => (
-          new Message({
-            method: 'CONNECT',
-            path: `/api/endpoints/${$selectedEp}/services/${proto}/${svc}`,
-          })
-        )).to($=>$
-          .muxHTTP(() => $selectedHub, { version: 2 }).to($=>$
-            .connectTLS(tlsOptions).to($=>$
-              .connect(() => $selectedHub)
+        .pipe(() => {
+          var hole = findHole(ep, proto, svc)
+          if(hole) return pipeline($ => $
+            .connectHTTPTunnel(() => new Message({
+              method: 'CONNECT',
+              path: `/api/services/${proto}/${svc}`,
+            })).to(hole.directSession())
+          )
+          return pipeline($ => $
+            .connectHTTPTunnel(() => (
+              new Message({
+                method: 'CONNECT',
+                path: `/api/endpoints/${$selectedEp}/services/${proto}/${svc}`,
+              })
+            )).to($ => $
+              .muxHTTP(() => $selectedHub, { version: 2 }).to($ => $
+                .connectTLS(tlsOptions).to($ => $
+                  .connect(() => $selectedHub)
+                )
+              )
             )
           )
-        )
+        })
         .pipe(proto === 'udp' ? unwrapUDP : bypass)
         .onEnd(() => logInfo(`Proxy to ${svc} at endpoint ${$selectedEp} via ${$selectedHub} ended`))
       ),
-      'deny': ($=>$
+      'deny': ($ => $
         .onStart(() => logError($selectedEp ? `No route to endpoint ${$selectedEp}` : `No endpoint found for ${svc}`))
         .replaceData(new StreamEnd)
       ),
@@ -532,10 +967,14 @@ export default function (config) {
   )
 
   // Start sending heartbeats
+  // TODO: add heartbeat for direct connections.
   heartbeat()
   function heartbeat() {
     if (!exited) {
-      hubs.forEach(h => h.heartbeat())
+      hubs.forEach(h => {
+        h.heartbeat()
+        h.holes.forEach((_, hole) => hole.heartbeat())
+      })
       new Timeout(15).wait().then(heartbeat)
     }
   }
@@ -589,6 +1028,41 @@ export default function (config) {
     return hubs[0].findEndpoint(ep)
   }
 
+  function findHole(ep, proto, svc) {
+    return hubs[0].findHole(ep, proto, svc)
+  }
+
+  function findFile(pathname) {
+    return hubs[0].findFile(pathname)
+  }
+
+  function findApp(ep, provider, app) {
+    if (ep === config.agent.id) {
+      var isInstalled = apps.list(provider).includes(app)
+      var isPublished = Boolean(fs.stat(`/home/${provider}/apps/pkg/${app}`))
+      if (isPublished || isInstalled) {
+        return Promise.resolve({
+          ...getAppNameTag(app),
+          provider,
+          isPublished,
+          isRunning: false,
+        })
+      } else {
+        return Promise.resolve(null)
+      }
+    } else {
+      return selectHubWithThrow(ep).then(
+        (hub) => httpAgents.get(hub).request(
+          'GET', `/api/forward/${ep}/apps/${provider}/${app}`
+        ).then(
+          res => {
+            return res.head?.status === 200 ? JSON.decode(res.body) : null
+          }
+        )
+      )
+    }
+  }
+
   function discoverEndpoints() {
     return hubs[0].discoverEndpoints()
   }
@@ -633,13 +1107,24 @@ export default function (config) {
     return `${ip}/${protocol}/${port}`
   }
 
+  // considering NAT, ip & port pair isn't strong enough to be distinguished.
+  function holeName(ep, protocol, svcName) {
+    return `${ep}/${protocol}/${svcName}`
+  }
+
   function openPort(ip, protocol, port, service, endpoint) {
     var key = portName(ip, protocol, port)
+    var p = ports[key]
     try {
       switch (protocol) {
         case 'tcp':
         case 'udp':
-          pipy.listen(`${ip}:${port}`, protocol, proxyToMesh(protocol, service, endpoint))
+          if (p && p.open) {
+            // FIXME only close port when hole punched successfully.
+            closePort(ip, protocol, port) // should it be closed?
+          } else {
+            pipy.listen(`${ip}:${port}`, protocol, proxyToMesh(protocol, service, endpoint))
+          }
           break
         default: throw `Invalid protocol: ${protocol}`
       }
@@ -658,6 +1143,10 @@ export default function (config) {
   function checkPort(ip, protocol, port) {
     var key = portName(ip, protocol, port)
     return ports[key]
+  }
+
+  function randomPort() {
+    return Number.parseInt(Math.random() * (65535 - 1024)) + 1024
   }
 
   function remoteQueryServices(ep) {

@@ -285,6 +285,23 @@ var routes = Object.entries({
     },
   },
 
+  // '/api/meshes/{mesh}/endpoints/{ep}/ports/{ip}/{proto}/{port}/punch': {
+  //   'GET': function({mesh, ep, ip, proto, port}) {
+  //     var port = api.getPort(mesh, ep, ip, proto, Number.parseInt(port)).then(
+  //       ret => {
+  //         if(ret) {
+  //           var body = JSON.decode(ret.body)
+
+
+  //         }
+  //         return response(404)
+  //       }
+  //     )
+
+
+  //   }
+  // }
+
 }).map(
   function ([path, methods]) {
     var match = new http.Match(path)
