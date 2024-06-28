@@ -81,7 +81,7 @@ export default function (config) {
 
   function Hub(address) {
     var connections = new Set
-    var holes = {}
+    var holes = new Map()
     var closed = false
     var serviceList = null
     var serviceListUpdateTime = 0
@@ -208,7 +208,7 @@ export default function (config) {
 
     function updateHoles() {
       holes.forEach((key, hole) => {
-        if (hole.state === 'fail') delete holes[key]
+        if (hole.state === 'fail' || hole.state === 'closed') holes.delete(key)
       })
     }
 
@@ -228,7 +228,7 @@ export default function (config) {
       var hole = Hole(epName, svc, key)
 
       if (hole.state != 'fail') {
-        holes[key] = hole
+        holes.set(key, hole)
         return hole
       }
 
