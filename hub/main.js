@@ -63,7 +63,7 @@ var routes = Object.entries({
     'DELETE': () => forwardRequest,
   },
 
-  '/api/punch/{ep}/{proto}/{svc}/request': {
+  '/api/punch/{srcEp}/{destEp}/request': {
     'GET': () => forwardRequest,
     'POST': () => syncPunch,
   }
@@ -175,6 +175,9 @@ function start() {
             if (evt instanceof MessageStart) {
               var path = evt.head.path
               var route = routes.find(r => Boolean($params = r.match(path)))
+              if(!path.startsWith('/api/status')) {
+                console.info(`Handling ${path} from ${JSON.encode($ctx)}`)
+              }
               if (route) return route.handler($params, evt)
               return notFound
             }
@@ -411,11 +414,12 @@ var syncPunch = pipeline($ => $
       if (!canOperate($ctx.username, ep)) return notAllowed
 
       var targetHub
+      // FIXME find the right hub session
       sessions[$ctx.id]?.forEach?.(h => $hubSelected = h)
       sessions[$params.ep]?.forEach?.(h => targetHub = h)
       if (!$hubSelected) return notFound
 
-      req.head.path = `/api/punch/${$params.ep}/${$params.proto}/${$params.svc}/sync`
+      req.head.path = `/api/punch/${$params.srcEp}/${$params.destEp}/sync`
       req.head.method = 'POST'
 
       var msgToSrc = req

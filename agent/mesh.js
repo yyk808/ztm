@@ -130,7 +130,10 @@ export default function (config) {
 
     // Send a request to the hub
     var requestHub = pipeline($ => $
-      .onStart(msg => msg)
+      .onStart(msg => {
+        console.info(`Reqesting Hub: ${JSON.encode(msg.head)}`)
+        return msg
+      })
       .pipe(hubSession)
       .handleMessage(msg => $response = msg)
       .replaceMessage(new StreamEnd)
@@ -149,6 +152,10 @@ export default function (config) {
             })
           )
           .to(hubSession)
+          .handleMessage(msg => {
+            console.log(`Receiving Hub: ${JSON.encode(msg.head)}`)
+            return msg
+          })
           .pipe(serveHub)
         )
       )
@@ -208,7 +215,10 @@ export default function (config) {
 
     function updateHoles() {
       holes.forEach((key, hole) => {
-        if (hole.state === 'fail' || hole.state === 'closed') holes.delete(key)
+        if (hole.state === 'fail' || hole.state === 'closed') {
+          hole.leave()
+          holes.delete(key)
+        }
       })
     }
 
@@ -222,16 +232,15 @@ export default function (config) {
       )
     }
 
-    function createHole(epName, proto, svcName) {
-      var key = holeName(epName, proto, svcName)
-      var svc = findService(proto, svcName)
-      var hole = Hole(epName, svc, key)
-
+    function createHole(epName) {
+      var hole = Hole(epName)
       if (hole.state != 'fail') {
-        holes.set(key, hole)
+        holes.set(epName, hole)
+        console.info(`Hole created, target ep: ${epName}`)
         return hole
       }
 
+      logInfo("Failed to create hole")
       return null
     }
 
@@ -296,8 +305,7 @@ export default function (config) {
       )
     }
 
-    function findHole(ep, proto, svcName) {
-      var key = holeName(ep, proto, svcName)
+    function findHole(ep) {
       return holes[key]
     }
 
@@ -330,8 +338,10 @@ export default function (config) {
   } // End of class Hub
 
   // Only available for symmetric NAT
-  function Hole(ep, svc, holeName) {
-    // TODO: Hole should be bound to ep not svc
+  function Hole(ep) {
+    // FIXME: Hole should be bound to ep not svc
+    // create hole when find ep.
+    // hub save ep pair that fail or success
     var bound = '0.0.0.0:' + randomPort()   // local port that the hole using
     var destIP                              // dest ip out of NAT
     var destPort                            // dest port out of NAT
@@ -342,14 +352,20 @@ export default function (config) {
     var state = 'closed'
     var $hubConnection = null
     var $connection = null
-    var $hub = hubs[0]
+    var $hub = null
     var $pHub = new pipeline.Hub
     var $session
     var $hubResponse
 
+    selectHub(ep).then(res => $hub = res)
+    if (!$hub) {
+      state = 'fail'
+      return {}
+    }
+
     // A temp tunnel to help hub gather NAT info.
     var hubSession = pipeline($ => $
-      .muxHTTP(() => holeName + "hub", { version: 2 }).to($ => $
+      .muxHTTP(() => ep + "hub", { version: 2 }).to($ => $
         .connectTLS({
           ...tlsOptions,
           onState: (session) => {
@@ -366,6 +382,7 @@ export default function (config) {
               }
 
               if (conn.state === 'connected' && state === 'closed') {
+                console.info("Tmp Hub Connection created")
                 state = 'forwarding'
                 reverseServer.spawn()
               }
@@ -401,16 +418,16 @@ export default function (config) {
     var servePunch = pipeline($ => $
       .demuxHTTP().to($ => $.pipe(() => {
         var routes = Object.entries({
-          '/api/punch/{ep}/{proto}/{svc}/sync': {
+          '/api/punch/{srcEp}/{destEp}/sync': {
             // Hub sent synchronize message. Once receive, start punch.
             // Agent <- Hub -> Remote Agent.
             'POST': function (params, req) {
               var body = JSON.decode(req.body)
-              destIP = body.dstIP
+              destIP = body.destIP
               destPort = body.port
               state = 'ready'
 
-              punch()
+              punch(destIP, destPort)
             }
           },
         }).map(function ([path, methods]) {
@@ -457,7 +474,7 @@ export default function (config) {
       if (role === 'client') {
         // make session to server side directly
         $session = pipeline($ => $
-          .muxHTTP(() => holeName + "direct", { version: 2 }).to($ => $
+          .muxHTTP(() => ep + "direct", { version: 2 }).to($ => $
             .connect(`${destIP}:${destPort}`, {
               onState: function (conn) {
                 if (conn.state === 'open') {
@@ -474,6 +491,12 @@ export default function (config) {
               },
               bind: bound
             })
+            .handleStreamEnd(evt => {
+              if (evt.error) {
+                state = 'fail'
+                leave()
+              }
+            })
           )
         )
 
@@ -487,7 +510,7 @@ export default function (config) {
               .connectHTTPTunnel(
                 new Message({
                   method: 'CONNECT',
-                  path: `/api/punch/${ep}/${proto}/${svc.name}`,
+                  path: `/api/punch/${config.agent.id}/${ep}`,
                 })
               )
               .to($session)
@@ -500,7 +523,7 @@ export default function (config) {
         pipy.listen(bound, 'tcp', serveHub)
 
         $session = pipeline($ => $
-          .muxHTTP(() => holeName + "direct", { version: 2 }).to($ => $
+          .muxHTTP(() => ep + "direct", { version: 2 }).to($ => $
             .swap(() => $pHub)
           )
         )
@@ -518,7 +541,7 @@ export default function (config) {
       pipeline($ => $
         .onStart(new Message({
           method: 'GET',
-          path: `/api/punch/${ep}/${proto}/${svc}/request`,
+          path: `/api/punch/${config.agent.id}/${ep}/request`,
         }))
         .pipe(hubSession)
         .handleMessage(msg => $hubResponse = msg)
@@ -535,7 +558,7 @@ export default function (config) {
       pipeline($ => $
         .onStart(new Message({
           method: 'POST',
-          path: `/api/punch/${ep}/${proto}/${svc}/reqeust`,
+          path: `/api/punch/${config.agent.id}/${ep}/reqeust`,
         }))
         .pipe(hubSession)
         .handleMessage(msg => $hubResponse = msg)
@@ -606,8 +629,8 @@ export default function (config) {
       $hubConnection = null
       $connection = null
 
-      if(state != 'fail') state = 'closed'
-      $hub.updateHoles()
+      if (state != 'fail') state = 'closed'
+      $hub?.updateHoles()
     }
 
     return {
@@ -624,7 +647,7 @@ export default function (config) {
   } // End of Hole
 
   var matchServices = new http.Match('/api/services/{proto}/{svc}')
-  var matchPunch = new http.Match('/api/punch/{ep}/{proto}/{svc}')
+  var matchPunch = new http.Match('/api/punch/{srcEp}/{destEp}')
   var response200 = new Message({ status: 200 })
   var response404 = new Message({ status: 404 })
 
@@ -651,7 +674,7 @@ export default function (config) {
 
               var punchParams = matchPunch(evt.head.path)
               if (punchParams) {
-                var hole = findHole(punchParams.ep, punchParams.proto, punchParams.svc)
+                var hole = findHole(punchParams.srcEp)
                 return hole.makeRespTunnel()
               }
             }
@@ -729,7 +752,9 @@ export default function (config) {
           db.setPort(meshName, params.ip, params.proto, port, body)
 
           // request to punch a hole.
-          var hole = hubs[0].createHole(target.endpoint, params.proto, target.svc)
+          console.info("========== Creating Hole ========")
+          var hole = hubs[0].createHole(target.endpoint)
+          console.info("Request punch")
           hole.requestPunch()
 
           return response(201, db.getPort(meshName, params.ip, params.proto, port))
@@ -749,11 +774,12 @@ export default function (config) {
         }
       },
 
-      '/api/punch/{ep}/{proto}/{svc}/request': {
+      '/api/punch/{srcEp}/{destEp}/request': {
         // handle punch hole request from peer or hub.
         // Agent ---> Hub ---> Service Publisher(Remote Agent)
         'GET': function (params) {
-          var hole = hubs[0].createHole(params.ep, params.proto, params.svc)
+          var hole = hubs[0].createHole(params.ep)
+          console.info("Accepting punch")
           hole.acceptPunch()
 
           return response(200)
@@ -977,6 +1003,9 @@ export default function (config) {
       var listen = p.listen
       var target = p.target
       openPort(listen.ip, p.protocol, listen.port, target.service, target.endpoint)
+
+      // create a closed hole
+      hubs[0].createHole(target.endpoint, p.protocol, target.service)
     }
   )
 
@@ -1092,11 +1121,6 @@ export default function (config) {
     return `${ip}/${protocol}/${port}`
   }
 
-  // considering NAT, ip & port pair isn't strong enough to be distinguished.
-  function holeName(ep, protocol, svcName) {
-    return `${ep}/${protocol}/${svcName}`
-  }
-
   function openPort(ip, protocol, port, service, endpoint) {
     var key = portName(ip, protocol, port)
     var p = ports[key]
@@ -1107,9 +1131,8 @@ export default function (config) {
           if (p && p.open) {
             // FIXME only close port when hole punched successfully.
             closePort(ip, protocol, port) // should it be closed?
-          } else {
-            pipy.listen(`${ip}:${port}`, protocol, proxyToMesh(protocol, service, endpoint))
           }
+          pipy.listen(`${ip}:${port}`, protocol, proxyToMesh(protocol, service, endpoint))
           break
         default: throw `Invalid protocol: ${protocol}`
       }
