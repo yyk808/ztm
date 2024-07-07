@@ -306,7 +306,7 @@ export default function (config) {
     }
 
     function findHole(ep) {
-      return holes[key]
+      return holes.get(ep)
     }
 
     function leave() {
@@ -346,7 +346,6 @@ export default function (config) {
     var destIP                              // dest ip out of NAT
     var destPort                            // dest port out of NAT
     var role = null                         // server or client
-    var proto = svc.protocol
 
     // closed forwarding connecting(ready punching) connected fail
     var state = 'closed'
@@ -406,7 +405,7 @@ export default function (config) {
           .connectHTTPTunnel(
             new Message({
               method: 'CONNECT',
-              path: `/api/endpoints/${config.agent.id}`,
+              path: `/api/punch/${config.agent.id}/${ep}`,
             })
           )
           .to(hubSession)

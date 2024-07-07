@@ -63,6 +63,10 @@ var routes = Object.entries({
     'DELETE': () => forwardRequest,
   },
 
+  '/api/endpoints/{srcEp}/{destEp}': {
+    'CONNECT': () => connectEndpoint,
+  },
+
   '/api/punch/{srcEp}/{destEp}/request': {
     'GET': () => forwardRequest,
     'POST': () => syncPunch,
@@ -130,7 +134,7 @@ function endpointName(id) {
 }
 
 function isEndpointOnline(ep) {
-  if (!sessions[ep.id]?.size) return false
+  if (!sessions[ep.id].normal?.size) return false
   if (ep.heartbeat + 30 * 1000 < Date.now()) return false
   return true
 }
@@ -342,13 +346,20 @@ var muxToAgent = muxToTarget($hubSelected)
 var connectEndpoint = pipeline($ => $
   .acceptHTTPTunnel(
     function () {
-      var id = $params.ep
+      var id = $params.ep ? $params.ep : $params.srcEp
       $ctx.id = id
       $hub = new pipeline.Hub
-      sessions[id] ??= new Set
-      sessions[id].add($hub)
+      sessions[id] ??= {normal: null, punch: null}
+      sessions[id].normal = new Set
+      sessions[id].punch = new Map
+      if($params.srcEp) {
+        // handle hole puching tunnel
+        sessions[id].punch.set($params.destEp, $hub)
+      } else {
+        sessions[id].normal.add($hub)
+      }
       collectMyNames($ctx.via)
-      console.info(`Endpoint ${endpointName(id)} joined, connections = ${sessions[id].size}`)
+      console.info(`Endpoint ${endpointName(id)} joined, normal connections = ${sessions[id].normal.size}, punching = ${sessions[id].punch.size}`)
       return response(200)
     }
   ).to($ => $
@@ -356,8 +367,9 @@ var connectEndpoint = pipeline($ => $
     .swap(() => $hub)
     .onEnd(() => {
       var id = $ctx.id
-      sessions[id]?.delete?.($hub)
-      console.info(`Endpoint ${endpointName(id)} left, connections = ${sessions[id]?.size || 0}`)
+      sessions[id].normal?.delete?.($hub)
+      sessions[id].punch?.delete?.($params.destEp)
+      console.info(`Endpoint ${endpointName(id)} left, connections = ${(sessions[id].normal?.size || 0) + sessions[id].punch?.size || 0}`)
     })
   )
 )
@@ -372,7 +384,7 @@ var connectService = pipeline($ => $
       if (!ep) return response(404, 'Endpoint not found')
       if (!canConnect($ctx.username, ep, proto, svc)) return response(403)
       if (!ep.services.some(s => s.name === svc && s.protocol === proto)) return response(404, 'Service not found')
-      sessions[id]?.forEach?.(h => $hubSelected = h)
+      sessions[id].normal?.forEach?.(h => $hubSelected = h)
       if (!$hubSelected) return response(404, 'Agent not found')
       console.info(`Forward to ${svc} at ${endpointName(id)}`)
       return response(200)
@@ -395,7 +407,7 @@ var forwardRequest = pipeline($ => $
         var ep = endpoints[id]
         if (!ep) return notFound
         if (!canOperate($ctx.username, ep)) return notAllowed
-        sessions[id]?.forEach?.(h => $hubSelected = h)
+        sessions[id].normal?.forEach?.(h => $hubSelected = h)
         if (!$hubSelected) return notFound
         var path = $params['*']
         req.head.path = `/api/${path}`
@@ -408,16 +420,15 @@ var forwardRequest = pipeline($ => $
 var syncPunch = pipeline($ => $
   .pipe(function (req) {
     if (req instanceof MessageStart) {
-      var srcEp = endpoints[$ctx.id]
-      var destEp = endpoints[$params.ep]
+      var srcEp = endpoints[$params.srcEp]
+      var destEp = endpoints[$params.destEp]
       if (!srcEp || !destEp) return notFound
       if (!canOperate($ctx.username, ep)) return notAllowed
 
       var targetHub
-      // FIXME find the right hub session
-      sessions[$ctx.id]?.forEach?.(h => $hubSelected = h)
-      sessions[$params.ep]?.forEach?.(h => targetHub = h)
-      if (!$hubSelected) return notFound
+      $hubSelected = sessions[$params.srcEp]?.targetHub = punch.get(destEp)
+      sessions[$params.destEp]?.punch.get(srcEp)
+      if (!$hubSelected || targetHub) return notFound
 
       req.head.path = `/api/punch/${$params.srcEp}/${$params.destEp}/sync`
       req.head.method = 'POST'
@@ -453,11 +464,11 @@ var syncPunch = pipeline($ => $
 pipeline($ => $
   .onStart(new Message({ path: '/api/ping' }))
   .repeat(() => new Timeout(15).wait().then(true)).to($ => $
-    .forkJoin(() => Object.keys(sessions)).to($ => $
+    .forkJoin(() => Object.keys(sessions.normal)).to($ => $
       .onStart(id => { $pingID = id })
       .forkJoin(() => {
         var hubs = []
-        sessions[$pingID].forEach(h => hubs.push(h))
+        sessions[$pingID].normal.forEach(h => hubs.push(h))
         return hubs
       }).to($ => $
         .onStart(hub => { $hubSelected = hub })
@@ -465,7 +476,7 @@ pipeline($ => $
         .replaceData()
         .replaceMessage(
           res => {
-            var hubs = sessions[$pingID]
+            var hubs = sessions[$pingID].normal
             if (res.head.status !== 200) {
               hubs?.delete?.($hubSelected)
               console.info(`Endpoint ${endpointName($pingID)} ping failure, connections = ${hubs?.size || 0}`)
