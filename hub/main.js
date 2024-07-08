@@ -352,6 +352,7 @@ var connectEndpoint = pipeline($ => $
       sessions[id] ??= {normal: null, punch: null}
       sessions[id].normal = new Set
       sessions[id].punch = new Map
+      console.info("Endpoint connected, ", $params)
       if($params.srcEp) {
         // handle hole puching tunnel
         sessions[id].punch.set($params.destEp, $hub)
@@ -425,6 +426,7 @@ var syncPunch = pipeline($ => $
       if (!srcEp || !destEp) return notFound
       if (!canOperate($ctx.username, ep)) return notAllowed
 
+
       var targetHub
       $hubSelected = sessions[$params.srcEp]?.targetHub = punch.get(destEp)
       sessions[$params.destEp]?.punch.get(srcEp)
@@ -445,6 +447,7 @@ var syncPunch = pipeline($ => $
         destPort: srcEp.port,
       }
 
+      console.info("Syched punching", msgToSrc, msgToDst)
       return pipeline($ => $
         .onStart(msgToDst)
         .fork().to($ => $

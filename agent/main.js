@@ -285,22 +285,16 @@ var routes = Object.entries({
     },
   },
 
-  // '/api/meshes/{mesh}/endpoints/{ep}/ports/{ip}/{proto}/{port}/punch': {
-  //   'GET': function({mesh, ep, ip, proto, port}) {
-  //     var port = api.getPort(mesh, ep, ip, proto, Number.parseInt(port)).then(
-  //       ret => {
-  //         if(ret) {
-  //           var body = JSON.decode(ret.body)
-
-
-  //         }
-  //         return response(404)
-  //       }
-  //     )
-
-
-  //   }
-  // }
+  '/api/punch/meshes/{mesh}/endpoints/{ep}': {
+    'GET': function({mesh, ep}) {
+      var hole = api.createHole(mesh, ep)
+      if(hole) {
+        hole.requestPunch()
+        return response(200, hole)
+      }
+      else return response(500)
+    }
+  }
 
 }).map(
   function ([path, methods]) {

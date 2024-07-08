@@ -219,6 +219,12 @@ function delPort(mesh, ep, ip, proto, port) {
   }
 }
 
+function createHole(mesh, ep) {
+  // manually create a hole to the ep
+  var m = findMesh(mesh)
+  return m.createHole(ep)
+}
+
 export default {
   init,
   allMeshes,
@@ -237,4 +243,5 @@ export default {
   getPort,
   setPort,
   delPort,
+  createHole,
 }

@@ -130,10 +130,7 @@ export default function (config) {
 
     // Send a request to the hub
     var requestHub = pipeline($ => $
-      .onStart(msg => {
-        console.info(`Reqesting Hub: ${JSON.encode(msg.head)}`)
-        return msg
-      })
+      .onStart(msg => msg)
       .pipe(hubSession)
       .handleMessage(msg => $response = msg)
       .replaceMessage(new StreamEnd)
@@ -233,8 +230,12 @@ export default function (config) {
     }
 
     function createHole(epName) {
-      var hole = Hole(epName)
-      if (hole.state != 'fail') {
+      if(!epName) {
+        return null
+      }
+
+      var hole = holes.get(epName) ? holes.get(epName) : Hole(epName)
+      if (hole && hole.state != 'fail') {
         holes.set(epName, hole)
         console.info(`Hole created, target ep: ${epName}`)
         return hole
@@ -339,13 +340,15 @@ export default function (config) {
 
   // Only available for symmetric NAT
   function Hole(ep) {
-    // FIXME: Hole should be bound to ep not svc
+    // FIXME: throw on init fail?
+
     // create hole when find ep.
     // hub save ep pair that fail or success
     var bound = '0.0.0.0:' + randomPort()   // local port that the hole using
     var destIP                              // dest ip out of NAT
     var destPort                            // dest port out of NAT
     var role = null                         // server or client
+    // var managedSvc = {}
 
     // closed forwarding connecting(ready punching) connected fail
     var state = 'closed'
@@ -354,16 +357,22 @@ export default function (config) {
     var $hub = null
     var $pHub = new pipeline.Hub
     var $session
-    var $hubResponse
+    var $response
 
-    selectHub(ep).then(res => $hub = res)
-    if (!$hub) {
-      state = 'fail'
-      return {}
-    }
+    console.info("Bound: ", bound)
 
     // A temp tunnel to help hub gather NAT info.
     var hubSession = pipeline($ => $
+      .onStart(() => {
+        return selectHub(ep).then(res => {
+          if(res) {
+            $hub = res
+          } else {
+            state = 'fail'
+          }
+          return new Data
+        })
+      })
       .muxHTTP(() => ep + "hub", { version: 2 }).to($ => $
         .connectTLS({
           ...tlsOptions,
@@ -372,18 +381,21 @@ export default function (config) {
             if (err) state = 'fail'
           }
         }).to($ => $
-          .connect($hub.address, {
+          .connect(() => $hub, {
             onState: function (conn) {
+              console.info('Tmp connection state ', conn, state)
               $hubConnection = conn
               if (conn.state === 'open') {
                 // SOL_SOCKET & SO_REUSEPORT
                 conn.socket.setRawOption(1, 15, new Data([1]))
-              }
-
-              if (conn.state === 'connected' && state === 'closed') {
+              } else if (conn.state === 'connected' && state === 'closed') {
                 console.info("Tmp Hub Connection created")
                 state = 'forwarding'
                 reverseServer.spawn()
+              } else if (conn.state === 'closed' && state === 'forwarding') {
+                // this means closed unexpectedly
+                state = 'fail'
+                leave()
               }
             },
             bind: bound,
@@ -421,6 +433,7 @@ export default function (config) {
             // Hub sent synchronize message. Once receive, start punch.
             // Agent <- Hub -> Remote Agent.
             'POST': function (params, req) {
+              // TODO use params to check
               var body = JSON.decode(req.body)
               destIP = body.destIP
               destPort = body.port
@@ -474,7 +487,7 @@ export default function (config) {
         // make session to server side directly
         $session = pipeline($ => $
           .muxHTTP(() => ep + "direct", { version: 2 }).to($ => $
-            .connect(`${destIP}:${destPort}`, {
+            .connect(() => `${destIP}:${destPort}`, {
               onState: function (conn) {
                 if (conn.state === 'open') {
                   conn.socket.setRawOption(1, 15, new Data([1]))
@@ -531,39 +544,48 @@ export default function (config) {
       return $session
     }
 
+    // Send a request.
+    var request = pipeline($ => $
+      .onStart(msg => {
+        console.info(`Reqesting Remote: ${JSON.encode(msg.head)}`)
+        return msg
+      })
+      .pipe(() => {
+        if (state === 'connected') {
+          return directSession()
+        } else if(state != 'fail') {
+          return hubSession
+        }
+
+        console.log(`State incorrect: ${state}, reject`)
+        return pipeline($=>$.dummy())
+      })
+      .handleMessage(msg => $response = msg)
+      .replaceMessage(new StreamEnd)
+      .onEnd(() => $response)
+    )
+
     // use THE port sending request to hub.
     function requestPunch() {
       // FIXME: add state check
-      state = 'connecting'
+      // state = 'connecting'
       role = 'client'
 
-      pipeline($ => $
-        .onStart(new Message({
-          method: 'GET',
-          path: `/api/punch/${config.agent.id}/${ep}/request`,
-        }))
-        .pipe(hubSession)
-        .handleMessage(msg => $hubResponse = msg)
-        .replaceMessage(new StreamEnd)
-        .onEnd(() => $hubResponse)
-      ).spawn()
+      request.spawn(new Message({
+        method: 'GET',
+        path: `/api/punch/${config.agent.id}/${ep}/request`,
+      }))
     }
 
     // TODO add cert info into response
     function acceptPunch() {
-      state = 'connecting'
+      // state = 'connecting'
       role = 'server'
 
-      pipeline($ => $
-        .onStart(new Message({
-          method: 'POST',
-          path: `/api/punch/${config.agent.id}/${ep}/reqeust`,
-        }))
-        .pipe(hubSession)
-        .handleMessage(msg => $hubResponse = msg)
-        .replaceMessage(new StreamEnd)
-        .onEnd(() => $hubResponse)
-      ).spawn()
+      request.spawn(new Message({
+        method: 'POST',
+        path: `/api/punch/${config.agent.id}/${ep}/reqeust`,
+      }))
     }
 
     function punch(destIP, destPort) {
@@ -608,18 +630,12 @@ export default function (config) {
 
 
     function heartbeat() {
-      // no need to do so
-      if (role === 'server' || connectHub || state === 'failed') {
-        return
-      }
-
-      // requestHub.spawn(
-      //   new Message(
-      //     { method: 'POST', path: '/api/status' },
-      //     JSON.encode({ name: config.agent.name })
-      //   )
-      // )
-
+      request.spawn(
+        new Message(
+          { method: 'POST', path: '/api/status' },
+          JSON.encode({ name: config.agent.name })
+        )
+      )
     }
 
     function leave() {
@@ -627,13 +643,19 @@ export default function (config) {
       $connection?.close()
       $hubConnection = null
       $connection = null
-
       if (state != 'fail') state = 'closed'
-      $hub?.updateHoles()
+
+      // try to find the hub holding this hole
+      if($hub) {
+        var parent = hubs.find(h => $hub === h.address)
+        parent.updateHoles()
+      }
     }
 
     return {
       state,
+      destIP,
+      destPort,
       isConnected,
       requestPunch,
       acceptPunch,
@@ -751,7 +773,6 @@ export default function (config) {
           db.setPort(meshName, params.ip, params.proto, port, body)
 
           // request to punch a hole.
-          console.info("========== Creating Hole ========")
           var hole = hubs[0].createHole(target.endpoint)
           console.info("Request punch")
           hole.requestPunch()
@@ -977,7 +998,6 @@ export default function (config) {
   )
 
   // Start sending heartbeats
-  // TODO: add heartbeat for direct connections.
   heartbeat()
   function heartbeat() {
     if (!exited) {
@@ -1004,7 +1024,7 @@ export default function (config) {
       openPort(listen.ip, p.protocol, listen.port, target.service, target.endpoint)
 
       // create a closed hole
-      hubs[0].createHole(target.endpoint, p.protocol, target.service)
+      hubs[0].createHole(target.endpoint)
     }
   )
 
@@ -1154,6 +1174,12 @@ export default function (config) {
 
   function randomPort() {
     return Number.parseInt(Math.random() * (65535 - 1024)) + 1024
+  }
+
+  function createHole(ep) {
+    var hole = hubs[0].createHole(ep)
+    if(hole) hole.requestPunch()
+    return hole
   }
 
   function remoteQueryServices(ep) {
@@ -1337,6 +1363,7 @@ export default function (config) {
     openPort,
     closePort,
     checkPort,
+    createHole,
     remoteQueryServices,
     remotePublishService,
     remoteDeleteService,
